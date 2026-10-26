@@ -65,7 +65,7 @@ def gemini_transport(payload, status=200, seen=None):
     def handler(req: httpx.Request):
         if seen is not None:
             seen.append(req)
-        assert req.url.path == "/v1beta/models/gemini-2.5-flash:generateContent"
+        assert req.url.path == "/v1beta/models/gemini-3.8-flash:generateContent"
         assert req.headers["x-goog-api-key"] == "KEY"
         if status != 200:
             return httpx.Response(status, json={"error": {"message": "API key not valid"}})
