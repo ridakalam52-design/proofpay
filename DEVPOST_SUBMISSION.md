@@ -23,7 +23,8 @@ Most of the world's small jobs never touch a marketplace. A neighbour paints a w
 ## How we built it
 - **Backend:** Python FastAPI with a small, explicit escrow state machine (`draft → funded → verifying → paid | changes_requested | needs_review | voided`) on SQLite. Atomic compare-and-set status updates stop double-captures when requests race.
 - **PayPal:** OAuth client-credentials, **Orders v2** (create with `AUTHORIZE`, then authorize), and **Payments v2** (capture with `final_capture`, and void). Every money-moving call sends a `PayPal-Request-Id` for idempotency. The front end uses the **PayPal JS SDK** with `intent=authorize`.
-- **AI:** The Google Gemini REST API (`gemini-3.8-flash`, configurable) with **`responseSchema` structured JSON output** for both agents, and images sent inline for vision. We never trust model output blindly. A normalisation layer clamps confidences, lines verdicts up with the checklist, and downgrades any "approve" that has a failing item.
+- **AI:** The Google Gemini REST API (`gemini-3.1-flash-lite` with an automatic fallback chain, configurable) with **`responseSchema` structured JSON output** for both agents, and images sent inline for vision. We never trust model output blindly. A normalisation layer clamps confidences, lines verdicts up with the checklist, and downgrades any "approve" that has a failing item.
+- **Async AI:** deal creation and proof upload respond instantly; Gemini refines and reviews in the background and the page updates live. A single-capture guard means a verdict can only ever release money once.
 - **Frontend:** Jinja and vanilla JS, mobile-first, no build step. Pages poll for updates, so the client sees the verdict land live.
 - **Judge-friendly:** a **mock mode** turns on automatically when keys are missing (simulated PayPal authorize/capture/void and a deterministic AI stub), so anyone can run the full flow in under a minute. There are pytest tests for the whole parse → authorize → verify → capture/void flow, and the real PayPal and Gemini clients are tested against fake HTTP transports. The repo includes a Render blueprint for a free hosted demo.
 
@@ -51,9 +52,9 @@ Most of the world's small jobs never touch a marketplace. A neighbour paints a w
 - Dispute mediation where the AI summarises the evidence for both sides.
 
 ## Built with
-`python` · `fastapi` · `sqlite` · `jinja2` · `javascript` · `paypal-orders-v2` · `paypal-js-sdk` · `google-gemini` · `gemini-3.8-flash` · `render`
+`python` · `fastapi` · `sqlite` · `jinja2` · `javascript` · `paypal-orders-v2` · `paypal-js-sdk` · `google-gemini` · `gemini-3.1-flash-lite` · `render`
 
 ## Links
-- **Repo:** https://github.com/<your-username>/proofpay *(public, MIT)*
-- **Live demo:** https://proofpay.onrender.com *(replace with your Render URL)*
-- **Video:** https://youtu.be/<id>
+- **Repo:** https://github.com/ridakalam52-design/proofpay *(public, MIT)*
+- **Live demo:** https://proofpay-a167.onrender.com *(free Render instance: first load may take ~60s to wake; PayPal sandbox only)*
+- **Video:** https://youtu.be/l7d-wotfKDM
