@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <h1>Pay when the work is <span class="hl">proven</span>.</h1>
+  <p class="lead">Escrow for everyday gig deals — the painter, the tutor, the delivery run. Your money is held by PayPal, an AI agent checks the worker's photo proof against a checklist, and payment releases only when the job is done.</p>
+</section>
+
+<section class="card">
+  <h2>Describe the deal</h2>
+  <p class="muted">Write it like a text message. The AI turns it into terms and a proof checklist.</p>
+  <form id="create-form">
+    <textarea id="description" rows="3" maxlength="2000" required
+      placeholder="Ravi will paint my balcony wall white for $40 by Saturday"></textarea>
+    <div class="chips">
+      <button type="button" class="chip" data-ex="Ravi will paint my balcony wall white for $40 by Saturday">🎨 Painter</button>
+      <button type="button" class="chip" data-ex="Ananya will tutor my son in algebra for two hours for $25 by Friday and share the worksheet they completed">📚 Tutor</button>
+      <button type="button" class="chip" data-ex="Marco will deliver the birthday cake from Rosie's Bakery to 12 Lake Road for $15 by 6pm today">🚲 Delivery</button>
+      <button type="button" class="chip" data-ex="Priya will design a logo for my bakery 'Crumbs' with 3 color variations for $120 by next Monday">💻 Freelancer</button>
+    </div>
+    <button class="btn btn-primary btn-lg" id="create-btn" type="submit">Create deal with AI →</button>
+  </form>
+</section>
+
+<section class="steps">
+  <div class="step"><span>1</span><h3>Describe</h3><p>AI extracts worker, task, price, deadline and concrete proof criteria.</p></div>
+  <div class="step"><span>2</span><h3>Fund</h3><p>Pay with PayPal. Funds are <b>authorized</b> (held), not captured.</p></div>
+  <div class="step"><span>3</span><h3>Prove</h3><p>The worker opens a share link and uploads photos + a note.</p></div>
+  <div class="step"><span>4</span><h3>Release</h3><p>Gemini vision checks every item. Approved → captured. Not yet → specific feedback.</p></div>
+</section>
+{% endblock %}
+{% block scripts %}
+<script>
+  document.querySelectorAll('.chip').forEach(c => c.addEventListener('click', () => {
+    document.getElementById('description').value = c.dataset.ex;
+  }));
+  document.getElementById('create-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('create-btn');
+    const description = document.getElementById('description').value.trim();
+    busy(btn, true, 'AI is structuring your deal…');
+    try {
+      const deal = await api('/api/deals', { method: 'POST', body: { description } });
+      if (deal.clarifications && deal.clarifications.length) {
+        sessionStorage.setItem('pp-clar-' + deal.id, JSON.stringify(deal.clarifications));
+      }
+      location.href = deal.client_url;
+    } catch (err) { toast(err.message, true); busy(btn, false); }
+  });
+</script>
+{% endblock %}
