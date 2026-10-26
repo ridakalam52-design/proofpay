@@ -28,6 +28,15 @@ def _env(name: str, default: str = "") -> str:
 class Settings:
     gemini_api_key: str = field(default_factory=lambda: _env("GEMINI_API_KEY"))
     gemini_model: str = field(default_factory=lambda: _env("GEMINI_MODEL", "gemini-3.8-flash"))
+    # Tried once if the primary model still answers 404/503 after retries. Empty = no fallback.
+    gemini_fallback_model: str = field(default_factory=lambda: _env("GEMINI_FALLBACK_MODEL"))
+    # Per-HTTP-call timeout and total retry budget (seconds). AI runs in the background, so these
+    # can be generous without making anyone wait on a request.
+    gemini_timeout: float = field(default_factory=lambda: float(_env("GEMINI_TIMEOUT", "150")))
+    gemini_total_budget: float = field(default_factory=lambda: float(_env("GEMINI_TOTAL_BUDGET", "330")))
+    # "thread": real AI work runs in a background thread (default).
+    # "inline": run it synchronously inside the request (used by tests; handy for debugging).
+    ai_background: str = field(default_factory=lambda: _env("AI_BACKGROUND", "thread").lower())
     paypal_client_id: str = field(default_factory=lambda: _env("PAYPAL_CLIENT_ID"))
     paypal_client_secret: str = field(default_factory=lambda: _env("PAYPAL_CLIENT_SECRET"))
     paypal_base: str = field(
