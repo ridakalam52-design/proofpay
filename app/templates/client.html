@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}{{ deal_id }} · ProofPay (client){% endblock %}
+{% block content %}
+<div id="app" data-role="client" data-token="{{ token }}" data-paypal-mock="{{ 'true' if paypal_mock else 'false' }}">
+  <div class="card skeleton">Loading deal…</div>
+</div>
+{% endblock %}
+{% block scripts %}
+{% if not paypal_mock %}
+<script src="https://www.paypal.com/sdk/js?client-id={{ paypal_client_id }}&currency=USD&intent=authorize&components=buttons" data-namespace="paypal"></script>
+{% endif %}
+<script>ProofPay.boot();</script>
+{% endblock %}
