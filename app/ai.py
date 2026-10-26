@@ -127,23 +127,27 @@ class GeminiAgent:
         self.api_key = api_key
         self.model = model
         self.mode = f"gemini:{model}"
+        self._thinking_ok = True
         self._http = httpx.Client(
-            base_url="https://generativelanguage.googleapis.com", timeout=90.0, transport=transport
+            base_url="https://generativelanguage.googleapis.com", timeout=30.0, transport=transport
         )
 
     def _generate(self, parts: list[dict], schema: dict) -> dict:
-        body = {
-            "contents": [{"role": "user", "parts": parts}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "responseMimeType": "application/json",
-                "responseSchema": schema,
-            },
-        }
         import time
+        gen = {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+        }
+        if self._thinking_ok:
+            # Fast path: minimal reasoning keeps parse/verify responses snappy for demos.
+            gen["thinkingConfig"] = {"thinkingLevel": "low"}
+        body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": gen}
+        deadline = time.monotonic() + 45.0  # total budget; after this the app falls back safely
         r = None
-        # Retry transient overload/rate-limit errors (429/500/503) with short backoff.
-        for attempt in range(4):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 r = self._http.post(
                     f"/v1beta/models/{self.model}:generateContent",
@@ -151,12 +155,17 @@ class GeminiAgent:
                     headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
                 )
             except httpx.HTTPError as e:
-                if attempt == 3:
+                if attempt >= 3 or time.monotonic() > deadline:
                     raise AIError(f"Gemini request failed: {e}") from e
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(1.0 * attempt)
                 continue
-            if r.status_code in (429, 500, 503) and attempt < 3:
-                time.sleep(1.5 * (attempt + 1))
+            if r.status_code == 400 and "thinking" in r.text.lower() and "thinkingConfig" in gen:
+                # Model doesn't support thinking control: remember and retry without it.
+                self._thinking_ok = False
+                gen.pop("thinkingConfig", None)
+                continue
+            if r.status_code in (429, 500, 503) and attempt < 3 and time.monotonic() + 2 < deadline:
+                time.sleep(1.0 * attempt)
                 continue
             break
         if r.status_code != 200:
