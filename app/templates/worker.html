@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block title %}{{ deal_id }} · ProofPay (worker){% endblock %}
+{% block content %}
+<div id="app" data-role="worker" data-token="{{ token }}">
+  <div class="card skeleton">Loading deal…</div>
+</div>
+{% endblock %}
+{% block scripts %}<script>ProofPay.boot();</script>{% endblock %}
