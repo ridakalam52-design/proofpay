@@ -5,11 +5,21 @@ r"""ProofPay deal lifecycle - the escrow state machine.
                                          |          \-> needs_review --client--> paid | changes_requested | voided
     funded / changes_requested / needs_review --client void--> voided
     funded / changes_requested / needs_review --client release--> paid
+
+AI is asynchronous when a real model is configured (Gemini can take minutes on free infra):
+  * create_deal answers at once with a rule-based draft (ai_status="refining") and refines it with
+    Gemini in the background; the refinement is applied only if the deal is still an unedited draft.
+  * submit_proof answers at once (deal "verifying", submission "ai_reviewing"); the verdict and the
+    money decision are applied in the background under a lock + compare-and-set, so a deal can never
+    be captured twice and an AI error never pays out (it goes to client review).
+With the deterministic MockAgent everything runs inline, so mock mode behaves exactly as before.
 """
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
+import threading
 import uuid
 from datetime import date
 from pathlib import Path
@@ -19,6 +29,8 @@ from .config import Settings
 from .db import DB, now_iso
 from .paypal import PayPalError
 
+log = logging.getLogger("proofpay")
+
 RELEASABLE = ("funded", "changes_requested", "needs_review")
 SUBMITTABLE = ("funded", "changes_requested")
 ALLOWED_MIME = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/heic": "heic",
@@ -27,7 +39,7 @@ ALLOWED_MIME = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "
 STATUS_LABELS = {
     "draft": "Draft - not funded yet",
     "funded": "Funded - waiting for proof",
-    "verifying": "AI is checking the proof",
+    "verifying": "AI is reviewing the proof",
     "changes_requested": "Changes requested",
     "needs_review": "Needs client review",
     "capturing": "Releasing payment",
@@ -50,7 +62,45 @@ class ProofPay:
         self.agent = agent
         self.pp = gateway
         self.fallback_agent = MockAgent()
+        self._decision_lock = threading.Lock()
         Path(settings.upload_dir).mkdir(parents=True, exist_ok=True)
+        self.recover_interrupted()
+
+    # ------------------------------------------------------------ background
+    @property
+    def ai_is_mock(self) -> bool:
+        return getattr(self.agent, "mode", "") == "mock"
+
+    def _spawn(self, fn, *args) -> None:
+        """Run slow AI work off the request. Inline for the mock agent or when AI_BACKGROUND=inline."""
+        def guarded():
+            try:
+                fn(*args)
+            except Exception:  # never let a background crash go silent
+                log.exception("ProofPay background task %s failed", getattr(fn, "__name__", fn))
+
+        if self.ai_is_mock or self.s.ai_background == "inline":
+            guarded()
+        else:
+            threading.Thread(target=guarded, name=f"proofpay-{getattr(fn, '__name__', 'ai')}", daemon=True).start()
+
+    def recover_interrupted(self) -> None:
+        """Background work dies with the process (e.g. a free instance restarting). Fail safe on startup:
+        unfinished proof reviews go to client review (never auto-pay); unfinished refinements keep the draft."""
+        for sub in self.db.submissions_with_status("ai_reviewing"):
+            deal = self.db.deal_by("id", sub["deal_id"])
+            if not deal:
+                continue
+            verdict = self._error_verdict(deal["checklist"], "the server restarted before the AI review finished")
+            if self.db.claim_submission(sub["id"], "ai_reviewing", "done"):
+                self.db.update_submission(sub["id"], verdict, "needs_review")
+                if self.db.transition(deal["id"], ("verifying",), "needs_review"):
+                    self.db.log(deal["id"], "system", "warning",
+                                "AI review was interrupted by a server restart - asked the client to review manually.")
+        for deal in self.db.deals_with_ai_status("refining"):
+            self.db.update_deal(deal["id"], ai_status="failed")
+            self.db.log(deal["id"], "system", "warning",
+                        "AI refinement was interrupted by a server restart; kept the rule-based draft. Please review the fields.")
 
     # ------------------------------------------------------------------ deals
     def create_deal(self, description: str) -> dict:
@@ -60,13 +110,21 @@ class ProofPay:
         if len(description) > 2000:
             raise FlowError("Description is too long (max 2000 characters).")
         note = None
-        try:
-            parsed = self.agent.parse_deal(description, today=date.today().strftime("%A %Y-%m-%d"))
-            ai_mode = self.agent.mode
-        except AIError as e:
+        today = date.today().strftime("%A %Y-%m-%d")
+        refine = not self.ai_is_mock
+        if refine:
+            # Instant rule-based draft; the real model refines it in the background.
             parsed = self.fallback_agent.parse_deal(description)
-            ai_mode = "mock-fallback"
-            note = f"AI parser unavailable ({e}); used rule-based fallback. Please review the fields."
+            ai_mode, ai_status = "rule-based draft", "refining"
+        else:
+            try:
+                parsed = self.agent.parse_deal(description, today=today)
+                ai_mode = self.agent.mode
+            except AIError as e:
+                parsed = self.fallback_agent.parse_deal(description)
+                ai_mode = "mock-fallback"
+                note = f"AI parser unavailable ({e}); used rule-based fallback. Please review the fields."
+            ai_status = "done"
         deal_id = "PP-" + secrets.token_hex(3).upper()
         ts = now_iso()
         deal = {
@@ -80,23 +138,59 @@ class ProofPay:
             "currency": parsed["currency"],
             "deadline": parsed["deadline"],
             "checklist": parsed["checklist"],
+            "clarifications": parsed.get("clarifications", []),
             "status": "draft",
             "ai_mode": ai_mode,
+            "ai_status": ai_status,
+            "draft_version": 0,
             "paypal_mode": self.pp.mode,
             "created_at": ts,
             "updated_at": ts,
         }
         self.db.insert_deal(deal)
         self.db.log(deal_id, "client", "created", "Deal described in plain language", {"description": description})
-        self.db.log(deal_id, "ai", "parsed",
-                    f"AI structured the deal: {parsed['worker_name']} - {parsed['task']} - "
-                    f"${parsed['amount']} - due {parsed['deadline']} - {len(parsed['checklist'])} proof criteria",
-                    {"parsed": parsed, "agent": ai_mode})
+        summary = (f"{parsed['worker_name']} - {parsed['task']} - ${parsed['amount']} - due {parsed['deadline']} - "
+                   f"{len(parsed['checklist'])} proof criteria")
+        if refine:
+            self.db.log(deal_id, "ai", "parsed", f"Quick draft (rule-based): {summary}. Gemini is refining it in the background.",
+                        {"parsed": parsed, "agent": ai_mode})
+        else:
+            self.db.log(deal_id, "ai", "parsed", f"AI structured the deal: {summary}", {"parsed": parsed, "agent": ai_mode})
         if note:
             self.db.log(deal_id, "system", "warning", note)
+        if refine:
+            self._spawn(self._refine_deal, deal_id, description, today, 0)
         out = self.db.deal_by("id", deal_id)
-        out["clarifications"] = parsed.get("clarifications", [])
+        out["clarifications"] = out.get("clarifications") or []
         return out
+
+    def _refine_deal(self, deal_id: str, description: str, today: str, version: int) -> None:
+        """Background: real-model parse. Applied only if the deal is still a draft the client hasn't edited."""
+        try:
+            parsed = self.agent.parse_deal(description, today=today)
+        except Exception as e:  # AIError or anything unexpected: keep the rule-based draft
+            self.db.update_deal(deal_id, ai_status="failed", ai_mode="mock-fallback")
+            self.db.log(deal_id, "system", "warning",
+                        f"AI parser unavailable ({e}); kept the rule-based draft. Please review the fields.")
+            log.warning("ProofPay %s: AI refine failed: %s", deal_id, e)
+            return
+        summary = (f"{parsed['worker_name']} - {parsed['task']} - ${parsed['amount']} - due {parsed['deadline']} - "
+                   f"{len(parsed['checklist'])} proof criteria")
+        applied = self.db.apply_refinement(
+            deal_id, version,
+            worker_name=parsed["worker_name"], task=parsed["task"], amount=parsed["amount"],
+            currency=parsed["currency"], deadline=parsed["deadline"], checklist=parsed["checklist"],
+            clarifications=parsed.get("clarifications", []), ai_mode=self.agent.mode, ai_status="done",
+        )
+        if applied:
+            self.db.log(deal_id, "ai", "refined", f"AI refined the deal: {summary}",
+                        {"parsed": parsed, "agent": self.agent.mode})
+        else:
+            self.db.update_deal(deal_id, ai_status="done")
+            self.db.log(deal_id, "ai", "refine_skipped",
+                        "AI finished refining, but the terms were already edited or funded - kept them unchanged.",
+                        {"parsed": parsed, "agent": self.agent.mode})
+            log.info("ProofPay %s: AI refinement arrived after edit/funding; not applied", deal_id)
 
     def update_draft(self, deal: dict, fields: dict) -> dict:
         if deal["status"] != "draft":
@@ -116,7 +210,8 @@ class ProofPay:
                 raise FlowError("Keep at least one proof criterion.")
             upd["checklist"] = items[:8]
         if upd:
-            self.db.update_deal(deal["id"], **upd)
+            if not self.db.edit_draft(deal["id"], **upd):
+                raise FlowError("Deal terms are locked once funded.", 409)
             self.db.log(deal["id"], "client", "edited", "Client adjusted deal terms: " + ", ".join(sorted(upd)))
         return self.db.deal_by("id", deal["id"])
 
@@ -195,58 +290,91 @@ class ProofPay:
                 hashes.append(sha)
             self.db.insert_submission({
                 "id": sub_id, "deal_id": deal["id"], "note": (note or "")[:1000], "photos": stored,
-                "photo_hashes": hashes, "verdict": None, "decision": None, "created_at": now_iso(),
+                "photo_hashes": hashes, "verdict": None, "decision": None, "status": "ai_reviewing",
+                "created_at": now_iso(),
             })
             self.db.log(deal["id"], "worker", "proof_submitted",
                         f"{deal['worker_name']} submitted {len(files)} photo(s)" + (f": \u201c{note[:120]}\u201d" if note else ""),
                         {"submission_id": sub_id})
             for sig in signals:
                 self.db.log(deal["id"], "system", "fraud_signal", sig)
-
-            try:
-                verdict = self.agent.verify_proof(
-                    deal, note or "", [(mime, blob) for _, mime, blob in files],
-                    signals=signals, filenames=[n for n, _, _ in files],
-                )
-                verdict["agent"] = self.agent.mode
-            except AIError as e:
-                verdict = {
-                    "items": [{"criterion": c, "passed": False, "confidence": 0.0,
-                               "reasoning": "AI verification unavailable."} for c in deal["checklist"]],
-                    "overall": "uncertain", "confidence": 0.0, "suspicious": False, "suspicion_reasons": [],
-                    "summary": f"AI verification failed ({e}). The client will review manually.",
-                    "feedback_to_worker": "Your proof was received and is waiting for the client to review it.",
-                    "agent": "error",
-                }
-            if signals and not verdict.get("suspicious"):
-                verdict["suspicious"] = True
-                verdict["suspicion_reasons"] = list(verdict.get("suspicion_reasons") or []) + signals
+            if not self.ai_is_mock:
+                self.db.log(deal["id"], "ai", "reviewing", "AI is reviewing the proof in the background.",
+                            {"submission_id": sub_id})
         except Exception:
             self.db.transition(deal["id"], ("verifying",), prev_status)
             raise
 
-        decision = self.decide(verdict)
-        verdict["threshold"] = self.s.approval_threshold
-        self.db.update_submission(sub_id, verdict, decision)
-        passed = sum(1 for it in verdict["items"] if it["passed"])
-        self.db.log(deal["id"], "ai", "verdict",
-                    f"AI verdict: {verdict['overall'].upper()} - {passed}/{len(verdict['items'])} criteria met, "
-                    f"confidence {verdict['confidence']:.0%}" + (" - flagged as suspicious" if verdict["suspicious"] else ""),
-                    {"submission_id": sub_id, "decision": decision})
-
-        if decision == "auto_release":
-            self.db.transition(deal["id"], ("verifying",), "funded")
-            return self._capture(self.db.deal_by("id", deal["id"]), actor="ai",
-                                 reason=f"AI approved proof with {verdict['confidence']:.0%} confidence")
-        if decision == "changes_requested":
-            self.db.transition(deal["id"], ("verifying",), "changes_requested")
-            self.db.log(deal["id"], "ai", "changes_requested",
-                        "Feedback sent to worker: " + (verdict.get("feedback_to_worker") or "")[:300])
-        else:
-            self.db.transition(deal["id"], ("verifying",), "needs_review")
-            self.db.log(deal["id"], "ai", "needs_review",
-                        "Not confident enough to move money automatically - asked the client to review.")
+        snapshot = {k: deal[k] for k in ("id", "worker_name", "task", "amount", "currency", "deadline", "checklist")}
+        self._spawn(self._review_submission, snapshot, sub_id, note or "",
+                    [(mime, blob) for _, mime, blob in files], signals, [n for n, _, _ in files])
         return self.db.deal_by("id", deal["id"])
+
+    @staticmethod
+    def _error_verdict(checklist: list[str], why: str) -> dict:
+        return {
+            "items": [{"criterion": c, "passed": False, "confidence": 0.0,
+                       "reasoning": "AI verification unavailable."} for c in checklist],
+            "overall": "uncertain", "confidence": 0.0, "suspicious": False, "suspicion_reasons": [],
+            "summary": f"AI verification failed ({why}). The client will review manually.",
+            "feedback_to_worker": "Your proof was received and is waiting for the client to review it.",
+            "agent": "error",
+        }
+
+    def _review_submission(self, deal: dict, sub_id: str, note: str, photos: list[tuple[str, bytes]],
+                           signals: list[str], filenames: list[str]) -> None:
+        """Background: run the vision verifier, then apply the verdict. Any error -> client review."""
+        try:
+            verdict = self.agent.verify_proof(deal, note, photos, signals=signals, filenames=filenames)
+            verdict["agent"] = self.agent.mode
+        except Exception as e:  # AIError or anything unexpected: never auto-pay
+            log.warning("ProofPay %s: AI verification failed: %s", deal["id"], e)
+            verdict = self._error_verdict(deal["checklist"], str(e))
+        if signals and not verdict.get("suspicious"):
+            verdict["suspicious"] = True
+            verdict["suspicion_reasons"] = list(verdict.get("suspicion_reasons") or []) + signals
+        self._apply_verdict(deal["id"], sub_id, verdict)
+
+    def _apply_verdict(self, deal_id: str, sub_id: str, verdict: dict) -> None:
+        """Apply a verdict exactly once. The lock + submission CAS + deal-status CAS make a double capture
+        impossible even if two reviews (or a review and a client action) race."""
+        with self._decision_lock:
+            if not self.db.claim_submission(sub_id, "ai_reviewing", "deciding"):
+                log.info("ProofPay %s: verdict for %s already applied; ignoring", deal_id, sub_id)
+                return
+            deal = self.db.deal_by("id", deal_id)
+            verdict["threshold"] = self.s.approval_threshold
+            if not deal or deal["status"] != "verifying":
+                self.db.update_submission(sub_id, verdict, "superseded")
+                self.db.log(deal_id, "system", "warning",
+                            "AI verdict arrived after the deal had moved on - no action taken.")
+                return
+            decision = self.decide(verdict)
+            self.db.update_submission(sub_id, verdict, decision)
+            passed = sum(1 for it in verdict["items"] if it["passed"])
+            self.db.log(deal_id, "ai", "verdict",
+                        f"AI verdict: {verdict['overall'].upper()} - {passed}/{len(verdict['items'])} criteria met, "
+                        f"confidence {verdict['confidence']:.0%}" + (" - flagged as suspicious" if verdict["suspicious"] else ""),
+                        {"submission_id": sub_id, "decision": decision})
+
+            if decision == "auto_release":
+                try:
+                    self._capture(deal, actor="ai", reason=f"AI approved proof with {verdict['confidence']:.0%} confidence",
+                                  from_statuses=("verifying",))
+                except FlowError as e:
+                    # capture failed (PayPal error or state moved): hand to the client, never retry silently
+                    if self.db.transition(deal_id, ("verifying",), "needs_review"):
+                        self.db.log(deal_id, "system", "needs_review",
+                                    f"Automatic release failed ({e}) - asked the client to review.")
+                return
+            if decision == "changes_requested":
+                self.db.transition(deal_id, ("verifying",), "changes_requested")
+                self.db.log(deal_id, "ai", "changes_requested",
+                            "Feedback sent to worker: " + (verdict.get("feedback_to_worker") or "")[:300])
+            else:
+                self.db.transition(deal_id, ("verifying",), "needs_review")
+                self.db.log(deal_id, "ai", "needs_review",
+                            "Not confident enough to move money automatically - asked the client to review.")
 
     def decide(self, verdict: dict) -> str:
         all_pass = all(it["passed"] for it in verdict["items"])
@@ -289,8 +417,9 @@ class ProofPay:
                     f"Authorization {deal['authorization_id']} voided - ${deal['amount']} hold released back to the client")
         return self.db.deal_by("id", deal["id"])
 
-    def _capture(self, deal: dict, actor: str, reason: str) -> dict:
-        if not self.db.transition(deal["id"], (deal["status"],), "capturing"):
+    def _capture(self, deal: dict, actor: str, reason: str, from_statuses: tuple[str, ...] | None = None) -> dict:
+        from_statuses = from_statuses or (deal["status"],)
+        if not self.db.transition(deal["id"], from_statuses, "capturing"):
             raise FlowError("Deal changed state, refresh and try again.", 409)
         try:
             cap = self.pp.capture_authorization(
@@ -329,11 +458,14 @@ class ProofPay:
             "capture_id": deal["capture_id"],
             "paypal_order_id": deal["paypal_order_id"],
             "ai_mode": deal["ai_mode"],
+            "ai_status": deal.get("ai_status") or "done",
             "paypal_mode": deal["paypal_mode"],
             "created_at": deal["created_at"],
             "submissions": [
                 {"id": s["id"], "note": s["note"], "photos": [f"/media/{p}" for p in s["photos"]],
-                 "verdict": s["verdict"], "decision": s["decision"], "created_at": s["created_at"]}
+                 "verdict": s["verdict"], "decision": s["decision"],
+                 "status": "ai_reviewing" if s.get("status") in ("ai_reviewing", "deciding") else (s.get("status") or "done"),
+                 "created_at": s["created_at"]}
                 for s in subs
             ],
             "events": [{k: e[k] for k in ("ts", "actor", "kind", "message")} for e in events],
@@ -343,6 +475,7 @@ class ProofPay:
         st = deal["status"]
         if role == "client":
             out["client_url"] = f"/c/{deal['client_token']}"
+            out["clarifications"] = deal.get("clarifications") or []
             out["can"] = {"edit": st == "draft", "fund": st == "draft", "release": st in RELEASABLE,
                           "void": st in RELEASABLE, "request_changes": st in ("needs_review", "funded")}
         else:
