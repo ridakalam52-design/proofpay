@@ -1,7 +1,9 @@
 """FastAPI entrypoint: HTML pages + JSON API."""
 from __future__ import annotations
 
+import logging
 import mimetypes
+import threading
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -17,6 +19,25 @@ from .paypal import MockPayPal, PayPalClient
 from .services import FlowError, ProofPay
 
 APP_DIR = Path(__file__).resolve().parent
+
+log = logging.getLogger("proofpay")
+if not log.handlers:  # make INFO lines visible in Render / uvicorn logs
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(levelname)s:     [proofpay] %(message)s"))
+    log.addHandler(_h)
+    log.setLevel(logging.INFO)
+    log.propagate = False
+
+
+def log_available_flash_models(agent: GeminiAgent) -> None:
+    """One startup line listing 'flash' models visible to the key (never prints the key). Best effort."""
+    try:
+        names = agent.list_flash_models(timeout=8.0)
+        log.info("Gemini models with 'flash' available to this key: %s (using %s%s)",
+                 ", ".join(names) or "none", agent.model,
+                 f", fallback {agent.fallback_model}" if agent.fallback_model else "")
+    except Exception as e:  # noqa: BLE001 - diagnostics only
+        log.info("Could not list Gemini models at startup: %s", type(e).__name__)
 
 
 class CreateDeal(BaseModel):
@@ -43,7 +64,15 @@ def create_app(settings: Settings | None = None, agent=None, gateway=None) -> Fa
     settings = settings or Settings()
     db = DB(settings.database_path)
     if agent is None:
-        agent = MockAgent() if settings.ai_mock else GeminiAgent(settings.gemini_api_key, settings.gemini_model)
+        if settings.ai_mock:
+            agent = MockAgent()
+        else:
+            agent = GeminiAgent(settings.gemini_api_key, settings.gemini_model,
+                                fallback_model=settings.gemini_fallback_model,
+                                timeout=settings.gemini_timeout, budget=settings.gemini_total_budget)
+            # diagnostics in a background thread so startup is never blocked
+            threading.Thread(target=log_available_flash_models, args=(agent,), name="proofpay-models",
+                             daemon=True).start()
     if gateway is None:
         gateway = MockPayPal() if settings.paypal_mock else PayPalClient(
             settings.paypal_client_id, settings.paypal_client_secret, settings.paypal_base)
@@ -156,7 +185,7 @@ def create_app(settings: Settings | None = None, agent=None, gateway=None) -> Fa
             if mime == "image/jpg":
                 mime = "image/jpeg"
             files.append((f.filename or "photo", mime, blob))
-        # run the (blocking) AI + PayPal calls off the event loop
+        # store photos off the event loop; slow AI review continues in the background
         from starlette.concurrency import run_in_threadpool
         deal = await run_in_threadpool(svc.submit_proof, deal, note, files)
         return svc.view(deal, "worker")
