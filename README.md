@@ -49,6 +49,8 @@ flowchart LR
     VOID --> PP
 ```
 
+**Async AI review.** Gemini can take minutes on free infrastructure, so nobody waits on it. Creating a deal returns at once with an instant rule-based draft (`ai_status: refining`), and Gemini refines it in a background thread. Its result is applied only if the deal is still a draft the client hasn't edited; otherwise it is just logged. Uploading proof also returns at once (deal `verifying`, submission `ai_reviewing`). The verdict and the money decision are applied in the background, exactly once, under a lock plus an atomic status check, so a deal can't be captured twice. The pages show a spinner and pick up the result by polling. If the AI fails, times out or the server restarts mid-review, the deal goes to client review and is never auto-paid. In mock mode everything still completes instantly.
+
 **Deal state machine**
 
 ```mermaid
@@ -71,7 +73,7 @@ stateDiagram-v2
 
 ### Safety rails
 
-- **Money only moves on a clear decision.** Auto-capture needs `overall=approve`, *every* item passing, confidence ≥ `APPROVAL_THRESHOLD` (default 0.75) and no fraud flag. If Gemini says "approve" while an item fails, ProofPay downgrades the verdict to *uncertain*. If the AI call errors, the deal goes to client review and is **never** auto-released.
+- **Money only moves on a clear decision.** Auto-capture needs `overall=approve`, *every* item passing, confidence ≥ `APPROVAL_THRESHOLD` (default 0.75) and no fraud flag. If Gemini says "approve" while an item fails, ProofPay downgrades the verdict to *uncertain*. If the AI call errors or is interrupted, the deal goes to client review and is **never** auto-released.
 - **Idempotent PayPal calls.** Each authorize, capture and void sends a `PayPal-Request-Id`, so a retry can't capture twice. State changes use an atomic compare-and-set in SQLite.
 - **Fraud signals.** The server hashes every photo (SHA-256). A photo already used on another deal or an earlier submission is flagged and passed to the AI as a fact.
 - **Separate links.** The client link controls money. The worker link can only see the checklist and upload proof.
@@ -123,6 +125,7 @@ Copy `.env.example` to `.env` and fill in the keys. Each part switches to real m
 
 1. Go to https://aistudio.google.com/apikey → **Create API key**.
 2. Put it in `GEMINI_API_KEY`. You can change the model with `GEMINI_MODEL` (default `gemini-3.8-flash`).
+3. Optional: `GEMINI_FALLBACK_MODEL` (default empty) is tried once if the main model still returns 404/503 after retries. `GEMINI_TIMEOUT` (per call, default 150 s) and `GEMINI_TOTAL_BUDGET` (default 330 s) are generous because AI runs in the background. On startup the server logs one line listing the "flash" models your key can use.
 
 Restart `uvicorn`. The badges change to `AI: gemini:gemini-3.8-flash · PayPal: sandbox`, and the client page shows the real PayPal Smart Buttons.
 
