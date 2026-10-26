@@ -1,6 +1,7 @@
 <p align="center"><img src="docs/banner.jpg" alt="ProofPay: pay when the work is proven" width="100%"></p>
 
 <p align="center">
+<a href="https://youtu.be/l7d-wotfKDM"><b>🎬 Demo video</b></a> ·
 <a href="https://proofpay-a167.onrender.com"><b>▶ Live demo</b></a> ·
 <a href="#see-it-in-action"><b>Screenshots</b></a> ·
 <a href="DEVPOST_SUBMISSION.md"><b>Devpost write-up</b></a> ·
