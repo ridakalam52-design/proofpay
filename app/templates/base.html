@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}ProofPay — pay when the work is proven{% endblock %}</title>
+  <meta name="description" content="Escrow-style PayPal payments for informal gig deals. An AI agent verifies proof of work before money moves.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>✅</text></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/"><span class="logo">✓</span> ProofPay</a>
+    <div class="modes" title="Runtime mode">
+      <span class="badge {{ 'badge-warn' if modes.ai == 'mock' else 'badge-ok' }}">AI: {{ modes.ai }}</span>
+      <span class="badge {{ 'badge-warn' if modes.paypal == 'mock' else 'badge-ok' }}">PayPal: {{ modes.paypal }}</span>
+    </div>
+  </header>
+  <main class="wrap">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="foot">
+    ProofPay · PayPal Orders v2 (authorize → capture/void) + Gemini vision · MIT licensed
+  </footer>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/static/app.js"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>
