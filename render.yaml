@@ -14,7 +14,7 @@ services:
       - key: PROOFPAY_MODE
         value: auto
       - key: GEMINI_MODEL
-        value: gemini-2.5-flash
+        value: gemini-3.8-flash
       - key: APPROVAL_THRESHOLD
         value: "0.75"
       - key: PAYPAL_BASE
