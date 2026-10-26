@@ -123,7 +123,7 @@ Extra signals from the server (treat as facts): {signals}"""
 # Gemini
 # ---------------------------------------------------------------------------
 class GeminiAgent:
-    def __init__(self, api_key: str, model: str = "gemini-2.5-flash", transport: httpx.BaseTransport | None = None):
+    def __init__(self, api_key: str, model: str = "gemini-3.8-flash", transport: httpx.BaseTransport | None = None):
         self.api_key = api_key
         self.model = model
         self.mode = f"gemini:{model}"
