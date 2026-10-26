@@ -1,0 +1,32 @@
+# One-click free deploy: Render dashboard -> New -> Blueprint -> pick this repo.
+# Without keys it runs in MOCK mode; add the secrets in the dashboard for sandbox mode.
+services:
+  - type: web
+    name: proofpay
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: PROOFPAY_MODE
+        value: auto
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: APPROVAL_THRESHOLD
+        value: "0.75"
+      - key: PAYPAL_BASE
+        value: https://api-m.sandbox.paypal.com
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      # Free instances have an ephemeral disk: deals reset on redeploy/sleep (fine for a demo).
+      - key: DATABASE_PATH
+        value: /tmp/proofpay.db
+      - key: UPLOAD_DIR
+        value: /tmp/proofpay-uploads
