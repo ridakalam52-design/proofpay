@@ -204,19 +204,32 @@ class GeminiAgent:
     def _generate(self, parts: list[dict], schema: dict) -> dict:
         import time
         deadline = time.monotonic() + self.budget  # total budget; after this the app falls back safely
-        r = self._call_model(self.model, parts, schema, deadline)
+        # Try the primary model, then each fallback (comma-separated GEMINI_FALLBACK_MODEL),
+        # moving on when a model is missing, overloaded, out of quota, or times out.
+        models = [self.model] + [m.strip() for m in self.fallback_model.split(",")
+                                 if m.strip() and m.strip() != self.model]
+        errors: list[str] = []
+        r = None
         used = self.model
-        if r.status_code in (404, 503) and self.fallback_model and self.fallback_model != self.model:
-            # Primary model missing / overloaded even after retries: try the fallback model once.
-            primary_err = self._error(r, self.model)
+        for i, model in enumerate(models):
+            used = model
+            last = i == len(models) - 1
             try:
-                r = self._call_model(self.fallback_model, parts, schema, max(deadline, time.monotonic() + 60),
-                                     max_attempts=1)
+                r = self._call_model(model, parts, schema,
+                                     deadline if i == 0 else max(deadline, time.monotonic() + 60),
+                                     max_attempts=3 if i == 0 else 1)
             except AIError as e:
-                raise AIError(f"{primary_err}; fallback failed: {e}") from e
-            used = self.fallback_model
-        if r.status_code != 200:
-            raise self._error(r, used)
+                errors.append(str(e))
+                if last:
+                    raise AIError("; ".join(errors)) from e
+                continue
+            if r.status_code == 200:
+                break
+            if r.status_code in (404, 429, 500, 503) and not last:
+                errors.append(str(self._error(r, model)))
+                continue
+            errors.append(str(self._error(r, model)))
+            raise AIError("; ".join(errors))
         data = r.json()
         try:
             cand = data["candidates"][0]
