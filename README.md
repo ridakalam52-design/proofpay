@@ -1,3 +1,12 @@
+<p align="center"><img src="docs/banner.jpg" alt="ProofPay: pay when the work is proven" width="100%"></p>
+
+<p align="center">
+<a href="https://proofpay-a167.onrender.com"><b>▶ Live demo</b></a> ·
+<a href="#see-it-in-action"><b>Screenshots</b></a> ·
+<a href="DEVPOST_SUBMISSION.md"><b>Devpost write-up</b></a> ·
+MIT licensed · PayPal <b>sandbox only</b>, no real money
+</p>
+
 # ProofPay — pay when the work is proven ✅
 
 **Escrow-style PayPal payments for informal gig deals, with an AI agent that checks proof of work before any money moves.**
@@ -14,6 +23,17 @@ Nobody wants to pay first or work first:
 - **Clients** pay up front and hope the job gets done, or the job gets done badly.
 - **Workers** finish the job and then chase payment for weeks.
 - Marketplaces with escrow exist, but they are heavy and take big fees. They don't fit a neighbour, a tutor or a delivery run.
+
+
+## See it in action
+
+A real run on the live demo (PayPal sandbox): a $40 balcony-painting deal. The half-painted wall was **rejected** with specific feedback, the finished wall was **approved at 90% confidence**, and PayPal captured the held authorization automatically.
+
+| AI writes the contract | Half-done work: rejected |
+|---|---|
+| <img src="docs/ai_contract.jpg" alt="AI-generated terms and proof checklist"> | <img src="docs/reject.jpg" alt="AI verdict REJECT 0/3"> |
+| **Finished work: approved and paid** | **Flow** |
+| <img src="docs/approve.jpg" alt="AI verdict APPROVE 3/3, payment captured"> | Describe → Fund (PayPal `AUTHORIZE` hold) → Prove (photo) → Gemini verifies → Capture or client review / void |
 
 ## The solution
 
