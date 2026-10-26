@@ -27,7 +27,7 @@ def _env(name: str, default: str = "") -> str:
 @dataclass
 class Settings:
     gemini_api_key: str = field(default_factory=lambda: _env("GEMINI_API_KEY"))
-    gemini_model: str = field(default_factory=lambda: _env("GEMINI_MODEL", "gemini-2.5-flash"))
+    gemini_model: str = field(default_factory=lambda: _env("GEMINI_MODEL", "gemini-3.8-flash"))
     paypal_client_id: str = field(default_factory=lambda: _env("PAYPAL_CLIENT_ID"))
     paypal_client_secret: str = field(default_factory=lambda: _env("PAYPAL_CLIENT_SECRET"))
     paypal_base: str = field(
