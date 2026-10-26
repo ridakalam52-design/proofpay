@@ -122,9 +122,9 @@ Copy `.env.example` to `.env` and fill in the keys. Each part switches to real m
 ### 2. Google Gemini (free tier)
 
 1. Go to https://aistudio.google.com/apikey → **Create API key**.
-2. Put it in `GEMINI_API_KEY`. You can change the model with `GEMINI_MODEL` (default `gemini-2.5-flash`).
+2. Put it in `GEMINI_API_KEY`. You can change the model with `GEMINI_MODEL` (default `gemini-3.8-flash`).
 
-Restart `uvicorn`. The badges change to `AI: gemini:gemini-2.5-flash · PayPal: sandbox`, and the client page shows the real PayPal Smart Buttons.
+Restart `uvicorn`. The badges change to `AI: gemini:gemini-3.8-flash · PayPal: sandbox`, and the client page shows the real PayPal Smart Buttons.
 
 ## Deploy free on Render
 
@@ -162,7 +162,7 @@ The free disk is temporary, so deals reset whenever the service sleeps or redepl
 
 ## AI tools used
 
-- **Google Gemini API (`gemini-2.5-flash`)** inside the product:
+- **Google Gemini API (`gemini-3.8-flash`)** inside the product:
   1. A *deal-structuring agent* that turns text into JSON using `responseSchema`.
   2. A multimodal *verification agent* that returns a per-criterion verdict, confidence, reasoning, worker feedback and fraud flags.
 - **AI coding assistant.** An AI coding agent helped scaffold and write the code, tests and docs, and an AI image model generated the sample photos in `demo_assets/`. *(Edit this line to match the tools you actually used.)*
