@@ -123,57 +123,100 @@ Extra signals from the server (treat as facts): {signals}"""
 # Gemini
 # ---------------------------------------------------------------------------
 class GeminiAgent:
-    def __init__(self, api_key: str, model: str = "gemini-3.8-flash", transport: httpx.BaseTransport | None = None):
+    """Gemini REST client.
+
+    Calls are slow on cold/free infrastructure (minutes are possible), so the app runs them in a
+    background thread: the per-call `timeout` and the total retry `budget` can be generous.
+    """
+
+    def __init__(self, api_key: str, model: str = "gemini-3.8-flash", transport: httpx.BaseTransport | None = None,
+                 fallback_model: str = "", timeout: float = 150.0, budget: float = 330.0,
+                 retry_sleep: float = 1.0):
         self.api_key = api_key
         self.model = model
+        self.fallback_model = (fallback_model or "").strip()
         self.mode = f"gemini:{model}"
-        self._thinking_ok = True
+        self.budget = budget
+        self.timeout = timeout
+        self.retry_sleep = retry_sleep
+        self._thinking_ok: dict[str, bool] = {}  # per model: does it accept thinkingConfig?
         self._http = httpx.Client(
-            base_url="https://generativelanguage.googleapis.com", timeout=30.0, transport=transport
+            base_url="https://generativelanguage.googleapis.com", timeout=timeout, transport=transport
         )
 
-    def _generate(self, parts: list[dict], schema: dict) -> dict:
+    def _headers(self) -> dict:
+        return {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
+
+    def list_flash_models(self, timeout: float = 8.0) -> list[str]:
+        """Model names available to this key that contain 'flash' (for a startup log line)."""
+        r = self._http.get("/v1beta/models", params={"pageSize": 1000}, headers=self._headers(), timeout=timeout)
+        r.raise_for_status()
+        names = [str(m.get("name", "")).removeprefix("models/") for m in (r.json().get("models") or [])]
+        return sorted(n for n in names if "flash" in n.lower())
+
+    def _call_model(self, model: str, parts: list[dict], schema: dict, deadline: float,
+                    max_attempts: int = 3) -> httpx.Response:
+        """POST generateContent with retries. Returns the last response; raises AIError on transport failure."""
         import time
         gen = {
             "temperature": 0.2,
             "responseMimeType": "application/json",
             "responseSchema": schema,
         }
-        if self._thinking_ok:
-            # Fast path: minimal reasoning keeps parse/verify responses snappy for demos.
+        if self._thinking_ok.get(model, True):
+            # Fast path: minimal reasoning keeps parse/verify responses snappy.
             gen["thinkingConfig"] = {"thinkingLevel": "low"}
         body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": gen}
-        deadline = time.monotonic() + 45.0  # total budget; after this the app falls back safely
-        r = None
         attempt = 0
         while True:
             attempt += 1
+            remaining = deadline - time.monotonic()
+            # never let one call run past the total budget
+            call_timeout = max(5.0, min(self.timeout, remaining))
             try:
-                r = self._http.post(
-                    f"/v1beta/models/{self.model}:generateContent",
-                    json=body,
-                    headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
-                )
+                r = self._http.post(f"/v1beta/models/{model}:generateContent", json=body, headers=self._headers(),
+                                    timeout=call_timeout)
             except httpx.HTTPError as e:
-                if attempt >= 3 or time.monotonic() > deadline:
-                    raise AIError(f"Gemini request failed: {e}") from e
-                time.sleep(1.0 * attempt)
+                if attempt >= max_attempts or deadline - time.monotonic() < 10:
+                    raise AIError(f"Gemini request failed ({model}): {type(e).__name__} {e}".strip()) from e
+                time.sleep(self.retry_sleep * attempt)
                 continue
             if r.status_code == 400 and "thinking" in r.text.lower() and "thinkingConfig" in gen:
-                # Model doesn't support thinking control: remember and retry without it.
-                self._thinking_ok = False
+                # Model doesn't support thinking control: remember and retry without it (not an attempt).
+                self._thinking_ok[model] = False
                 gen.pop("thinkingConfig", None)
+                attempt -= 1
                 continue
-            if r.status_code in (429, 500, 503) and attempt < 3 and time.monotonic() + 2 < deadline:
-                time.sleep(1.0 * attempt)
+            if (r.status_code in (429, 500, 503) and attempt < max_attempts
+                    and time.monotonic() + 2 < deadline):
+                time.sleep(self.retry_sleep * attempt)
                 continue
-            break
-        if r.status_code != 200:
+            return r
+
+    @staticmethod
+    def _error(r: httpx.Response, model: str) -> AIError:
+        try:
+            msg = r.json().get("error", {}).get("message", r.text[:300])
+        except ValueError:
+            msg = r.text[:300]
+        return AIError(f"Gemini API {r.status_code} ({model}): {msg}")
+
+    def _generate(self, parts: list[dict], schema: dict) -> dict:
+        import time
+        deadline = time.monotonic() + self.budget  # total budget; after this the app falls back safely
+        r = self._call_model(self.model, parts, schema, deadline)
+        used = self.model
+        if r.status_code in (404, 503) and self.fallback_model and self.fallback_model != self.model:
+            # Primary model missing / overloaded even after retries: try the fallback model once.
+            primary_err = self._error(r, self.model)
             try:
-                msg = r.json().get("error", {}).get("message", r.text[:300])
-            except ValueError:
-                msg = r.text[:300]
-            raise AIError(f"Gemini API {r.status_code}: {msg}")
+                r = self._call_model(self.fallback_model, parts, schema, max(deadline, time.monotonic() + 60),
+                                     max_attempts=1)
+            except AIError as e:
+                raise AIError(f"{primary_err}; fallback failed: {e}") from e
+            used = self.fallback_model
+        if r.status_code != 200:
+            raise self._error(r, used)
         data = r.json()
         try:
             cand = data["candidates"][0]
