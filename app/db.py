@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS deals (
     authorization_id TEXT,
     capture_id TEXT,
     ai_mode TEXT,
+    ai_status TEXT,
+    draft_version INTEGER NOT NULL DEFAULT 0,
+    clarifications TEXT DEFAULT '[]',
     paypal_mode TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -37,6 +40,7 @@ CREATE TABLE IF NOT EXISTS submissions (
     photo_hashes TEXT DEFAULT '[]',
     verdict TEXT,
     decision TEXT,
+    status TEXT NOT NULL DEFAULT 'done',
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
@@ -52,7 +56,15 @@ CREATE INDEX IF NOT EXISTS idx_events_deal ON events(deal_id);
 CREATE INDEX IF NOT EXISTS idx_sub_deal ON submissions(deal_id);
 """
 
-JSON_COLS = {"checklist", "photos", "photo_hashes", "verdict", "data"}
+JSON_COLS = {"checklist", "photos", "photo_hashes", "verdict", "data", "clarifications"}
+
+# Columns added after the first release: (table, column, DDL) - applied to older databases on startup.
+MIGRATIONS = [
+    ("deals", "ai_status", "ALTER TABLE deals ADD COLUMN ai_status TEXT"),
+    ("deals", "draft_version", "ALTER TABLE deals ADD COLUMN draft_version INTEGER NOT NULL DEFAULT 0"),
+    ("deals", "clarifications", "ALTER TABLE deals ADD COLUMN clarifications TEXT DEFAULT '[]'"),
+    ("submissions", "status", "ALTER TABLE submissions ADD COLUMN status TEXT NOT NULL DEFAULT 'done'"),
+]
 
 
 def now_iso() -> str:
@@ -68,6 +80,10 @@ class DB:
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(SCHEMA)
+            for table, col, ddl in MIGRATIONS:
+                cols = {r[1] for r in self._conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if col not in cols:
+                    self._conn.execute(ddl)
             self._conn.commit()
 
     # -- helpers -----------------------------------------------------------
@@ -100,7 +116,8 @@ class DB:
 
     # -- deals -------------------------------------------------------------
     def insert_deal(self, deal: dict) -> None:
-        deal = {**deal, "checklist": json.dumps(deal.get("checklist", []))}
+        deal = {**deal, "checklist": json.dumps(deal.get("checklist", [])),
+                "clarifications": json.dumps(deal.get("clarifications", []))}
         cols = ", ".join(deal)
         qs = ", ".join("?" for _ in deal)
         self.execute(f"INSERT INTO deals ({cols}) VALUES ({qs})", tuple(deal.values()))
@@ -108,11 +125,40 @@ class DB:
     def update_deal(self, deal_id: str, **fields: Any) -> None:
         if not fields:
             return
-        fields["updated_at"] = now_iso()
-        if "checklist" in fields:
-            fields["checklist"] = json.dumps(fields["checklist"])
+        fields = self._enc(fields)
         sets = ", ".join(f"{k} = ?" for k in fields)
         self.execute(f"UPDATE deals SET {sets} WHERE id = ?", (*fields.values(), deal_id))
+
+    @staticmethod
+    def _enc(fields: dict) -> dict:
+        fields = {**fields, "updated_at": now_iso()}
+        for k in ("checklist", "clarifications"):
+            if k in fields:
+                fields[k] = json.dumps(fields[k])
+        return fields
+
+    def edit_draft(self, deal_id: str, **fields: Any) -> bool:
+        """Client edit: only while still a draft; bumps draft_version so background AI won't overwrite it."""
+        fields = self._enc(fields)
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        cur = self.execute(
+            f"UPDATE deals SET {sets}, draft_version = draft_version + 1 WHERE id = ? AND status = 'draft'",
+            (*fields.values(), deal_id),
+        )
+        return cur.rowcount == 1
+
+    def apply_refinement(self, deal_id: str, expected_version: int, **fields: Any) -> bool:
+        """Background AI parse result: applied only if still a draft the client hasn't edited since."""
+        fields = self._enc(fields)
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        cur = self.execute(
+            f"UPDATE deals SET {sets} WHERE id = ? AND status = 'draft' AND draft_version = ?",
+            (*fields.values(), deal_id, expected_version),
+        )
+        return cur.rowcount == 1
+
+    def deals_with_ai_status(self, ai_status: str) -> list[dict]:
+        return self.all("SELECT * FROM deals WHERE ai_status = ?", (ai_status,))
 
     def transition(self, deal_id: str, from_statuses: tuple[str, ...], to_status: str) -> bool:
         """Atomic compare-and-set on status. Returns False if the deal moved on."""
@@ -139,11 +185,23 @@ class DB:
         qs = ", ".join("?" for _ in sub)
         self.execute(f"INSERT INTO submissions ({cols}) VALUES ({qs})", tuple(sub.values()))
 
-    def update_submission(self, sub_id: str, verdict: dict, decision: str) -> None:
+    def update_submission(self, sub_id: str, verdict: dict, decision: str, status: str = "done") -> None:
         self.execute(
-            "UPDATE submissions SET verdict = ?, decision = ? WHERE id = ?",
-            (json.dumps(verdict), decision, sub_id),
+            "UPDATE submissions SET verdict = ?, decision = ?, status = ? WHERE id = ?",
+            (json.dumps(verdict), decision, status, sub_id),
         )
+
+    def claim_submission(self, sub_id: str, from_status: str, to_status: str) -> bool:
+        """Atomic compare-and-set on a submission's status (guards against applying a verdict twice)."""
+        cur = self.execute("UPDATE submissions SET status = ? WHERE id = ? AND status = ?",
+                           (to_status, sub_id, from_status))
+        return cur.rowcount == 1
+
+    def submission(self, sub_id: str) -> dict | None:
+        return self.one("SELECT * FROM submissions WHERE id = ?", (sub_id,))
+
+    def submissions_with_status(self, status: str) -> list[dict]:
+        return self.all("SELECT * FROM submissions WHERE status = ?", (status,))
 
     def submissions(self, deal_id: str) -> list[dict]:
         return self.all("SELECT * FROM submissions WHERE deal_id = ? ORDER BY created_at, rowid", (deal_id,))
