@@ -26,6 +26,10 @@
     return data;
   };
 
+  const aiBanner = (title, text) => `<div class="banner ai" role="status"><span class="spin"></span><div><b>${esc(title)}</b>${text ? `<p class="small">${esc(text)}</p>` : ''}</div></div>`;
+  const TERM_KEYS = ['worker_name', 'task', 'amount', 'deadline', 'checklist'];
+  const termsOf = (d) => JSON.stringify(TERM_KEYS.map((k) => d[k]));
+
   const statusPill = (d) => `<span class="pill pill-${esc(d.status)}">${esc(d.status_label)}</span>`;
 
   function dealHeader(d, role) {
@@ -41,6 +45,9 @@
         <p class="muted">⏰ Due: ${esc(d.deadline)}</p>
         ${d.status === 'paid' ? `<div class="banner ok">✅ Work proven — $${esc(d.amount)} captured via PayPal${d.capture_id ? ` <span class="mono">(${esc(d.capture_id)})</span>` : ''}.</div>` : ''}
         ${d.status === 'voided' ? `<div class="banner muted-b">↩️ Deal cancelled — the PayPal hold was voided and no money moved.</div>` : ''}
+        ${d.status === 'verifying' ? aiBanner('AI is reviewing the proof…', role === 'client'
+          ? 'Gemini is checking each item against the photos. Money only moves if every item passes with high confidence — this page updates on its own.'
+          : 'Gemini is checking your photos against the checklist. This can take a minute or two — you can keep this page open or come back later.') : ''}
         ${d.status === 'needs_review' && role === 'client' ? `<div class="banner warn">👀 The AI wasn't sure enough to move money. Please review the proof below and decide.</div>` : ''}
       </section>`;
   }
@@ -52,8 +59,11 @@
   function verdictBlock(sub, idx, total) {
     const v = sub.verdict;
     const photos = sub.photos.map((p) => `<a href="${esc(p)}" target="_blank" rel="noopener"><img src="${esc(p)}" alt="proof photo" loading="lazy"></a>`).join('');
-    if (!v) return `<div class="sub"><div class="photos">${photos}</div><p class="muted">Checking…</p></div>`;
-    const decisionLabel = { auto_release: '✅ Approved — payment released', changes_requested: '✏️ Changes requested', needs_review: '👀 Sent to client review' }[sub.decision] || sub.decision;
+    if (!v) return `<div class="sub"><div class="row between wrap-gap"><b>Submission ${idx + 1}${idx === total - 1 ? ' (latest)' : ''}</b>
+        <span class="muted small">${fmtTime(sub.created_at)}</span></div><div class="photos">${photos}</div>
+        ${sub.note ? `<p class="note">“${esc(sub.note)}”</p>` : ''}
+        <p class="reviewing small"><span class="spin"></span> AI is reviewing this proof…</p></div>`;
+    const decisionLabel = { auto_release: '✅ Approved — payment released', changes_requested: '✏️ Changes requested', needs_review: '👀 Sent to client review', superseded: 'ℹ️ Arrived after the deal moved on — no action taken' }[sub.decision] || sub.decision;
     return `
       <div class="sub">
         <div class="row between wrap-gap">
@@ -100,14 +110,15 @@
 
   // ------------------------------------------------------------------ client
   function renderClient(root, d, token, paypalMock) {
-    const clar = JSON.parse(sessionStorage.getItem('pp-clar-' + d.id) || '[]');
+    const clar = (d.clarifications && d.clarifications.length) ? d.clarifications : JSON.parse(sessionStorage.getItem('pp-clar-' + d.id) || '[]');
     let html = dealHeader(d, 'client');
     if (d.status === 'draft') {
       html += `
+      <div id="ai-refine">${refineBanner(d)}</div>
       ${clar.length ? `<section class="card banner warn"><b>AI wants you to double-check:</b><ul>${clar.map((c) => `<li>${esc(c)}</li>`).join('')}</ul></section>` : ''}
       <section class="card">
         <h3>1 · Review the terms</h3>
-        <p class="muted small">Extracted by AI from: “${esc(d.description)}”. Edit anything before funding — terms lock once the money is held.</p>
+        <p class="muted small">${d.ai_status === 'refining' ? 'Quick draft' : 'Extracted by AI'} from: “${esc(d.description)}”. Edit anything before funding — terms lock once the money is held.</p>
         <form id="edit-form" class="grid">
           <label>Worker<input name="worker_name" value="${esc(d.worker_name)}" required></label>
           <label>Amount (USD)<input name="amount" type="number" min="1" step="0.01" value="${esc(d.amount)}" required></label>
@@ -213,12 +224,35 @@
     act('changes', `/api/c/${token}/request-changes`, 'Sending…');
   }
 
-  async function saveIfDirty(token) {
-    const ef = document.getElementById('edit-form'); if (!ef) return;
+  function refineBanner(d) {
+    if (d.ai_status === 'refining') return `<section class="card">${aiBanner('AI is refining the deal…',
+      'These fields are an instant draft. Gemini is improving them in the background and they will update here automatically. You can edit and fund right away — if you save your own edits, your version wins.')}</section>`;
+    if (d.ai_status === 'failed') return `<section class="card banner muted-b small">ℹ️ The AI refinement didn't finish, so these terms come from the quick rule-based parser. Please check them before funding.</section>`;
+    return '';
+  }
+
+  function formTerms() {
+    const ef = document.getElementById('edit-form'); if (!ef) return null;
     const f = new FormData(ef);
-    await api(`/api/c/${token}`, { method: 'PATCH', body: {
-      worker_name: f.get('worker_name'), task: f.get('task'), amount: f.get('amount'), deadline: f.get('deadline'),
-      checklist: String(f.get('checklist')).split('\n').map((s) => s.trim()).filter(Boolean) } });
+    return { worker_name: String(f.get('worker_name')).trim(), task: String(f.get('task')).trim(), amount: f.get('amount'),
+      deadline: String(f.get('deadline')).trim(), checklist: String(f.get('checklist')).split('\n').map((s) => s.trim()).filter(Boolean) };
+  }
+  function formDirty(d) {
+    const t = formTerms(); if (!t || !d) return false;
+    return t.worker_name !== d.worker_name || t.task !== d.task || Number(t.amount) !== Number(d.amount)
+      || t.deadline !== d.deadline || JSON.stringify(t.checklist) !== JSON.stringify(d.checklist);
+  }
+
+  // Before funding: save the client's edits (they win), otherwise make sure the AI didn't change
+  // the terms in the background since they were shown - never fund terms the client hasn't seen.
+  async function saveIfDirty(token) {
+    const t = formTerms(); if (!t) return;
+    if (formDirty(state.data)) { await api(`/api/c/${token}`, { method: 'PATCH', body: t }); return; }
+    const fresh = await api(`/api/c/${token}`);
+    if (fresh.status === 'draft' && termsOf(fresh) !== termsOf(state.data)) {
+      state.set(fresh);
+      throw new Error('The AI just refined the terms — please review them, then fund.');
+    }
   }
 
   // ------------------------------------------------------------------ worker
@@ -270,13 +304,18 @@
         const fd = new FormData(); fd.append('note', pf.note.value);
         [...input.files].slice(0, 4).forEach((f) => fd.append('photos', f, f.name));
         const btn = document.getElementById('proof-btn');
-        busy(btn, true, 'AI is checking your proof…');
+        busy(btn, true, 'Uploading proof…');
         state.pause = true;
         try { const nd = await api(`/api/w/${token}/proof`, { method: 'POST', form: fd }); state.pause = false; state.set(nd);
-          toast(nd.status === 'paid' ? 'Approved — payment released! 🎉' : nd.status === 'changes_requested' ? 'Some items need fixing — see feedback' : 'Sent to the client for review');
+          toast(nd.status === 'verifying' ? 'Proof received — the AI is reviewing it now 🤖' : resultToast(nd.status));
         } catch (err) { state.pause = false; toast(err.message, true); busy(btn, false); }
       });
     }
+  }
+
+  function resultToast(status) {
+    return { paid: 'Approved — payment released! 🎉', changes_requested: 'Some items need fixing — see feedback',
+      needs_review: 'Sent to the client for review' }[status] || 'Updated';
   }
 
   // ------------------------------------------------------------------- boot
@@ -294,11 +333,30 @@
       // live updates (client sees the AI verdict land; worker sees funding / review decisions)
       setInterval(async () => {
         if (state.pause || !state.data || TERMINAL.includes(state.data.status) || document.hidden) return;
-        if (state.data.status === 'draft' && role === 'client') return; // don't clobber the edit form
+        const draft = state.data.status === 'draft' && role === 'client';
+        // drafts are only polled while the AI is refining them (never clobber the edit form)
+        if (draft && state.data.ai_status !== 'refining') return;
         const ae = document.activeElement;
-        if (ae && (ae.tagName === 'TEXTAREA' || (ae.tagName === 'INPUT' && ae.type !== 'button'))) return;
+        const typing = ae && (ae.tagName === 'TEXTAREA' || (ae.tagName === 'INPUT' && ae.type !== 'button'));
+        if (!draft && typing) return;
         if (document.getElementById('photos') && document.getElementById('photos').files.length) return;
-        try { const d = await api(url); if (JSON.stringify(d) !== state._json) state.set(d); } catch { /* offline */ }
+        try {
+          const d = await api(url);
+          if (JSON.stringify(d) === state._json) return;
+          if (draft && d.status === 'draft' && (typing || formDirty(state.data))) {
+            // the client is editing: keep their input, just update the AI banner
+            if (d.ai_status !== 'refining') {
+              const b = document.getElementById('ai-refine');
+              if (b) b.innerHTML = `<section class="card banner muted-b small">🤖 The AI finished refining. Your unsaved edits are kept — save them, or reload the page to see the AI's version.</section>`;
+              state.data = { ...state.data, ai_status: d.ai_status };
+            }
+            return;
+          }
+          const prev = state.data.status, prevTerms = termsOf(state.data);
+          state.set(d);
+          if (prev === 'verifying' && d.status !== 'verifying') toast(resultToast(d.status));
+          else if (draft && d.ai_status === 'done' && termsOf(d) !== prevTerms) toast('AI refined the deal terms ✨');
+        } catch { /* offline */ }
       }, 4000);
     },
   };
