@@ -37,7 +37,7 @@
     e.preventDefault();
     const btn = document.getElementById('create-btn');
     const description = document.getElementById('description').value.trim();
-    busy(btn, true, 'AI is structuring your deal…');
+    busy(btn, true, 'Creating your deal…');
     try {
       const deal = await api('/api/deals', { method: 'POST', body: { description } });
       if (deal.clarifications && deal.clarifications.length) {
