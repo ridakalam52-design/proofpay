@@ -140,14 +140,25 @@ class GeminiAgent:
                 "responseSchema": schema,
             },
         }
-        try:
-            r = self._http.post(
-                f"/v1beta/models/{self.model}:generateContent",
-                json=body,
-                headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
-            )
-        except httpx.HTTPError as e:
-            raise AIError(f"Gemini request failed: {e}") from e
+        import time
+        r = None
+        # Retry transient overload/rate-limit errors (429/500/503) with short backoff.
+        for attempt in range(4):
+            try:
+                r = self._http.post(
+                    f"/v1beta/models/{self.model}:generateContent",
+                    json=body,
+                    headers={"x-goog-api-key": self.api_key, "Content-Type": "application/json"},
+                )
+            except httpx.HTTPError as e:
+                if attempt == 3:
+                    raise AIError(f"Gemini request failed: {e}") from e
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            if r.status_code in (429, 500, 503) and attempt < 3:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            break
         if r.status_code != 200:
             try:
                 msg = r.json().get("error", {}).get("message", r.text[:300])
